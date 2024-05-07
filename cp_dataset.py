@@ -192,6 +192,7 @@ class CPDataset(data.Dataset):
 
         c_name[key] = self.c_names[key][index]
         c[key] = Image.open(osp.join(self.data_path, "cloth", c_name[key])).convert("RGB")
+        cloth_image = c[key] 
         c[key] = transforms.Resize(self.crop_size, interpolation=2)(c[key])
         c_img = c[key]
         ref_image_pa = self.transform(c_img)
@@ -388,6 +389,7 @@ class CPDatasetV2(CPDataset):
 
         c_name[key] = self.c_names[key][index]
         c[key] = Image.open(osp.join(self.data_path, "cloth", c_name[key])).convert("RGB")
+        cloth_path = osp.join(self.data_path, "cloth", c_name[key])
         c[key] = transforms.Resize(self.crop_size, interpolation=2)(c[key])
         c_img = c[key]
         cm[key] = Image.open(osp.join(self.data_path, "cloth-mask", c_name[key]))
@@ -513,6 +515,7 @@ class CPDatasetV2(CPDataset):
             "mask": mask,
             "ref_imgs": ref_image,
             "file_name": self.im_names[index],
+            "cloth_path": cloth_path,
             "prompt": caption_string,
             # "prompt": "upperbody",
         }

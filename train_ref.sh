@@ -1,5 +1,5 @@
-accelerate launch train.py \
-    --pretrained_model_name_or_path="runwayml/stable-diffusion-v1-5" \
+accelerate launch train_ref.py \
+    --pretrained_model_name_or_path="SG161222/Realistic_Vision_V4.0_noVAE" \
     --mixed_precision="no" \
     --output_dir="./output/logs/train_ootd" \
     --dataset_name="SaffalPoosh/VITON-HD-test" \
@@ -19,8 +19,6 @@ accelerate launch train.py \
     --seed="424" \
     --clip_grad_norm \
     --gradient_accumulation_steps="4"  \
-    --vton_unet_path="runwayml/stable-diffusion-v1-5"  \
-    --garm_unet_path="runwayml/stable-diffusion-v1-5"  \
     --validation_data_list="subtrain_1.txt" \
     --test_data_list="subtest_1.txt" \
     --tracker_project_name="train_controlnet" \

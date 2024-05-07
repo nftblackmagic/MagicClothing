@@ -14,13 +14,15 @@
 # See the License for the specific language governing permissions and
 
 import argparse
+import contextlib
+import gc
 import logging
 import math
 import os
 import random
 import shutil
+import copy
 from pathlib import Path
-from collections import defaultdict
 
 import accelerate
 import numpy as np
@@ -30,14 +32,14 @@ import torch.utils.checkpoint
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
+from accelerate.utils import ProjectConfiguration, set_seed
 from datasets import load_dataset
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from PIL import Image
 from torchvision import transforms
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer, PretrainedConfig
+from transformers import AutoTokenizer, PretrainedConfig, AutoProcessor, CLIPVisionModelWithProjection
 
 import diffusers
 from diffusers import (
@@ -48,33 +50,42 @@ from diffusers import (
     UNet2DConditionModel,
     UniPCMultistepScheduler,
 )
-from diffusers.pipelines import StableDiffusionPipeline
-
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
-from diffusers.utils import (
-    PIL_INTERPOLATION,
-    USE_PEFT_BACKEND,
-    deprecate,
-    replace_example_docstring,
-    scale_lora_layers,
-    unscale_lora_layers,
-)
-from transformers import AutoProcessor, CLIPVisionModelWithProjection
-from transformers import CLIPTextModel, CLIPTokenizer
-from diffusers.image_processor import PipelineImageInput, VaeImageProcessor
-
+from diffusers.pipelines import StableDiffusionPipeline
+from utils.utils import is_torch2_available, prepare_image, prepare_mask
 from cp_dataset import CPDatasetV2 as CPDataset
-import wandb
+from garment_adapter.garment_diffusion import ClothAdapter
 
-from magic_model import MagicClothingModel
+
+if is_torch2_available():
+    from garment_adapter.attention_processor import REFAttnProcessor2_0 as REFAttnProcessor
+    from garment_adapter.attention_processor import AttnProcessor2_0 as AttnProcessor
+    from garment_adapter.attention_processor import REFAnimateDiffAttnProcessor2_0 as REFAnimateDiffAttnProcessor
+else:
+    from garment_adapter.attention_processor import REFAttnProcessor, AttnProcessor
+
+if is_wandb_available():
+    import wandb
+
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
-# check_min_version("0.27.0.dev0")
+check_min_version("0.26.0.dev0")
 
 logger = get_logger(__name__)
+
+def tokenize_captions(tokenizer, captions, max_length):
+        
+    inputs = tokenizer(
+        captions,
+        max_length=tokenizer.model_max_length,
+        padding="max_length", 
+        truncation=True, 
+        return_tensors="pt"
+    )
+    return inputs.input_ids
 
 
 def image_grid(imgs, rows, cols):
@@ -87,77 +98,135 @@ def image_grid(imgs, rows, cols):
         grid.paste(img, box=(i % cols * w, i // cols * h))
     return grid
 
-
-def log_validation(model, args, accelerator, weight_dtype, test_dataloder = None, validation_dataloader = None):
-    logger.info("Running validation... ")
+# def log_validation(ref_unet, full_net, auto_processor, image_encoder, pipe, args, accelerator, weight_dtype, validation_dataloader = None):
+#     logger.info("Running validation... ")
     
-    # ref_unet = accelerator.unwrap_model(model.full_net.ref_unet)
-    # unet = accelerator.unwrap_model(model.full_net.pipe.unet)
-
+#     ref_unet = accelerator.unwrap_model(ref_unet)
     
-    # def sample_imgs(data_loader, log_key: str):
-    #     image_logs = []
-    #     with torch.no_grad():
-    #         for _, batch in enumerate(data_loader):
-    #             with torch.autocast("cuda"):
-    #                 prompt = batch["prompt"][0]
-    #                 image_garm = batch["ref_imgs"][0, :]
-    #                 image_vton = batch["inpaint_image"][0, :]
-    #                 image_ori= batch["GT"][0, :]
-    #                 inpaint_mask = batch["inpaint_mask"][0, :]
-    #                 mask = batch["mask"][0, :].unsqueeze(0)
+#     def sample_imgs(data_loader, log_key: str):
+#         image_logs = []
+#         with torch.no_grad():
+#             for _, batch in enumerate(data_loader):
+#                 with torch.autocast("cuda"):
+#                     prompt = batch["prompt"][0]
+#                     image_garm = batch["ref_imgs"][0, :]
+#                     image_vton = batch["inpaint_image"][0, :]
+#                     image_ori= batch["GT"][0, :]
+#                     inpaint_mask = batch["inpaint_mask"][0, :]
+#                     mask = batch["mask"][0, :].unsqueeze(0)
 
-    #                 # what is this doing?
-    #                 prompt_image = model.auto_processor(images=image_garm, return_tensors="pt").to(accelerator.device)
-    #                 prompt_image = model.image_encoder(prompt_image.data['pixel_values']).image_embeds
-    #                 prompt_image = prompt_image.unsqueeze(1)
-    #                 prompt_embeds = model.text_encoder(model.tokenize_captions([prompt], 2).to(accelerator.device))[0]
-    #                 prompt_embeds[:, 1:] = prompt_image[:]
+#                     prompt_embeds, negative_prompt_embeds = pipe.encode_prompt(
+#                         prompt,
+#                         device=accelerator.device,
+#                         num_images_per_prompt=1,
+#                         do_classifier_free_guidance=True,
+#                         negative_prompt="monochrome, lowres, bad anatomy, worst quality, low quality",
+#                     )
                     
-    #                 attn_store = {}
-    #                 cloth_embeds = pipeline.vae.encode(image_garm).latent_dist.mode() * pipeline.vae.config.scaling_factor
-    #                 prompt_embeds_null = pipeline.encode_prompt([""], device=accelerator.device, num_images_per_prompt=1, do_classifier_free_guidance=False)[0]
-    #                 ref_unet(torch.cat([cloth_embeds]), 0, prompt_embeds_null, cross_attention_kwargs={"attn_store": attn_store})
+#                     prompt_image = auto_processor(images=image_garm, return_tensors="pt").to(accelerator.device)
+#                     prompt_image = image_encoder(prompt_image.data['pixel_values']).image_embeds
+#                     prompt_image = prompt_image.unsqueeze(1)
+#                     prompt_embeds_null = pipe.text_encoder(tokenize_captions(pipe.tokenizer,[prompt], 2).to(accelerator.device))[0]
+#                     prompt_embeds_null[:, 1:] = prompt_image[:]
+                    
+#                     attn_store = {}
+#                     image_garm = pipe.image_processor.preprocess(image_garm)
+#                     garm_latents = pipe.vae.encode(image_garm).latent_dist.mode()
+#                     garm_latents = torch.cat([garm_latents], dim=0)
+#                     garm_latents = garm_latents * pipe.vae.config.scaling_factor
+#                     ref_unet(garm_latents, 0, prompt_embeds_null, cross_attention_kwargs={"attn_store": attn_store})
 
-    #                 samples = pipeline(
-    #                     prompt_embeds=prompt_embeds,
-    #                     num_inference_steps=args.inference_steps,
-    #                     generator=generator,
-    #                     height=512,
-    #                     width=384,
-    #                     cross_attention_kwargs={"attn_store": attn_store, "do_classifier_free_guidance": guidance_scale > 1.0, "enable_cloth_guidance": self.enable_cloth_guidance},
-    #                     **kwargs,
-    #                 ).images[0]
+#                     generator = torch.Generator(accelerator.device).manual_seed(args.seed)
+                    
+#                     samples = pipe(
+#                         prompt_embeds=prompt_embeds,
+#                         negative_prompt_embeds=negative_prompt_embeds,
+#                         guidance_scale=7.5,
+#                         num_inference_steps=args.inference_steps,
+#                         generator=generator,
+#                         height=512,
+#                         width=384,
+#                         cross_attention_kwargs={"attn_store": attn_store, "do_classifier_free_guidance": True, "enable_cloth_guidance": False},
+#                     ).images[0]
  
 
-    #                 image_logs.append({
-    #                     "garment": image_garm, 
-    #                     "model": image_vton, 
-    #                     "orig_img": image_ori, 
-    #                     "samples": samples, 
-    #                     "prompt": prompt,
-    #                     "inpaint mask": inpaint_mask,
-    #                     "mask": mask
-    #                     })
+#                     image_logs.append({
+#                         "garment": image_garm, 
+#                         "model": image_vton, 
+#                         "orig_img": image_ori, 
+#                         "samples": samples, 
+#                         "prompt": prompt,
+#                         "inpaint mask": inpaint_mask,
+#                         "mask": mask
+#                         })
 
-    #     for tracker in accelerator.trackers:
-    #         if tracker.name == "wandb":
-    #             formatted_images = []
-    #             for log in image_logs:
-    #                 formatted_images.append(wandb.Image(log["garment"], caption="garment images"))
-    #                 formatted_images.append(wandb.Image(log["model"], caption="masked model images"))
-    #                 formatted_images.append(wandb.Image(log["orig_img"], caption="original images"))
-    #                 formatted_images.append(wandb.Image(log["inpaint mask"], caption="inpaint mask"))
-    #                 formatted_images.append(wandb.Image(log["mask"], caption="mask"))
-    #                 formatted_images.append(wandb.Image(log["samples"], caption=log["prompt"]))
-    #             tracker.log({log_key: formatted_images})
-    #         else:
-    #             logger.warn(f"image logging not implemented for {tracker.name}")
+#         for tracker in accelerator.trackers:
+#             if tracker.name == "wandb":
+#                 formatted_images = []
+#                 for log in image_logs:
+#                     formatted_images.append(wandb.Image(log["garment"], caption="garment images"))
+#                     formatted_images.append(wandb.Image(log["model"], caption="masked model images"))
+#                     formatted_images.append(wandb.Image(log["orig_img"], caption="original images"))
+#                     formatted_images.append(wandb.Image(log["inpaint mask"], caption="inpaint mask"))
+#                     formatted_images.append(wandb.Image(log["mask"], caption="mask"))
+#                     formatted_images.append(wandb.Image(log["samples"], caption=log["prompt"]))
+#                 tracker.log({log_key: formatted_images})
+#             else:
+#                 logger.warn(f"image logging not implemented for {tracker.name}")
     
-    # if validation_dataloader is not None:
-    #     sample_imgs(validation_dataloader, "validation_images")
-    # if test_dataloder is not None:
-    #     sample_imgs(test_dataloder, "test_images")
+#     if validation_dataloader is not None:
+#         sample_imgs(validation_dataloader, "validation_images")
+
+def log_validation(ref_unet, full_net, auto_processor, image_encoder, pipe, args, accelerator, weight_dtype, validation_dataloader = None):
+    logger.info("Running validation... ")
+    
+    ref_unet = accelerator.unwrap_model(ref_unet)
+    
+    full_net.ref_unet = ref_unet
+    # images = full_net.generate(cloth_image)
+    
+    def sample_imgs(data_loader, log_key: str):
+        image_logs = []
+        with torch.no_grad():
+            for _, batch in enumerate(data_loader):
+                with torch.autocast("cuda"):
+                    prompt = batch["prompt"][0]
+                    image_garm = batch["ref_imgs"][0, :]
+                    image_vton = batch["inpaint_image"][0, :]
+                    image_ori= batch["GT"][0, :]
+                    inpaint_mask = batch["inpaint_mask"][0, :]
+                    mask = batch["mask"][0, :].unsqueeze(0)
+                    cloth_path = batch["cloth_path"][0]
+
+                    samples = full_net.generate(cloth_image=image_garm, cloth_mask_image=mask, prompt=prompt, width=512)
+                    
+                    image_logs.append({
+                        "garment": image_garm, 
+                        "model": image_vton, 
+                        "orig_img": image_ori, 
+                        "samples": samples[0][0], 
+                        "prompt": prompt,
+                        "inpaint mask": inpaint_mask,
+                        "mask": mask
+                        })
+
+        for tracker in accelerator.trackers:
+            if tracker.name == "wandb":
+                formatted_images = []
+                for log in image_logs:
+                    formatted_images.append(wandb.Image(log["garment"], caption="garment images"))
+                    formatted_images.append(wandb.Image(log["model"], caption="masked model images"))
+                    formatted_images.append(wandb.Image(log["orig_img"], caption="original images"))
+                    formatted_images.append(wandb.Image(log["inpaint mask"], caption="inpaint mask"))
+                    formatted_images.append(wandb.Image(log["mask"], caption="mask"))
+                    formatted_images.append(wandb.Image(log["samples"], caption=log["prompt"]))
+                tracker.log({log_key: formatted_images})
+            else:
+                logger.warn(f"image logging not implemented for {tracker.name}")
+    
+    if validation_dataloader is not None:
+        sample_imgs(validation_dataloader, "validation_images")
+
 
 def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str, revision: str):
     text_encoder_config = PretrainedConfig.from_pretrained(
@@ -171,7 +240,6 @@ def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: st
         from transformers import CLIPTextModel
 
         return CLIPTextModel
-    # TODO: what hell is this?
     elif model_class == "RobertaSeriesModelWithTransformation":
         from diffusers.pipelines.alt_diffusion.modeling_roberta_series import RobertaSeriesModelWithTransformation
 
@@ -181,10 +249,9 @@ def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: st
 
 
 def save_model_card(repo_id: str, image_logs=None, base_model=str, repo_folder=None):
-    """Only used for pushing the model HF hub."""
     img_str = ""
     if image_logs is not None:
-        img_str = "You can find some example images below.\n"
+        img_str = "You can find some example images below.\n\n"
         for i, log in enumerate(image_logs):
             images = log["images"]
             validation_prompt = log["validation_prompt"]
@@ -195,8 +262,12 @@ def save_model_card(repo_id: str, image_logs=None, base_model=str, repo_folder=N
             image_grid(images, 1, len(images)).save(os.path.join(repo_folder, f"images_{i}.png"))
             img_str += f"![images_{i})](./images_{i}.png)\n"
 
-    model_description = f"""controlnet-{repo_id} 
-    These are controlnet weights trained on {base_model} with new type of conditioning.{img_str}"""
+    model_description = f"""
+# controlnet-{repo_id}
+
+These are controlnet weights trained on {base_model} with new type of conditioning.
+{img_str}
+"""
     model_card = load_or_create_model_card(
         repo_id_or_path=repo_id,
         from_training=True,
@@ -212,6 +283,7 @@ def save_model_card(repo_id: str, image_logs=None, base_model=str, repo_folder=N
         "text-to-image",
         "diffusers",
         "controlnet",
+        "diffusers-training",
     ]
     model_card = populate_model_card(model_card, tags=tags)
 
@@ -590,17 +662,6 @@ def parse_args(input_args=None):
         help="if clip the gradients' norm by max_grad_norm"
     )
     
-    parser.add_argument(
-        "--vton_unet_path",
-        type=str,
-        default=None,
-    )
-    
-    parser.add_argument(
-        "--garm_unet_path",
-        type=str,
-        default=None,
-    )
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -624,8 +685,8 @@ def parse_args(input_args=None):
     return args
 
 
+
 def main(args):
-    args.notes = "Train from magic clothing model."
     if args.report_to == "wandb" and args.hub_token is not None:
         raise ValueError(
             "You cannot use both --report_to=wandb and --hub_token due to a security risk of exposing your token."
@@ -635,14 +696,17 @@ def main(args):
     logging_dir = Path(args.output_dir, args.logging_dir)
 
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
-    kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
         project_config=accelerator_project_config,
-        kwargs_handlers=[kwargs],
     )
+
+    # Disable AMP for MPS.
+    if torch.backends.mps.is_available():
+        accelerator.native_amp = False
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -672,32 +736,68 @@ def main(args):
                 repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
             ).repo_id
 
-    # Load the tokenizer
-    # TODO: create tokenizer in OOTD model
-    if args.tokenizer_name:
-        tokenizer_path = args.tokenizer_name
-    elif args.pretrained_model_name_or_path:
-        tokenizer_path = args.pretrained_model_name_or_path
+    def set_adapter(unet, type):
+        attn_procs = {}
+        for name in unet.attn_processors.keys():
+            if "attn1" in name:
+                attn_procs[name] = REFAttnProcessor(name=name, type=type)
+            else:
+                attn_procs[name] = AttnProcessor()
+        unet.set_attn_processor(attn_procs)
 
-    if args.vton_unet_path is None:
-        vton_unet_path = args.pretrained_model_name_or_path
-    else:
-        vton_unet_path = args.vton_unet_path
+    auto_processor = AutoProcessor.from_pretrained(args.vit_path)
+    image_encoder = CLIPVisionModelWithProjection.from_pretrained(args.vit_path).to(accelerator.device)
+
+    # Load the tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision, use_fast=False)
     
-    if args.garm_unet_path is None:
-        garm_unet_path = args.pretrained_model_name_or_path
-    else:
-        garm_unet_path = args.garm_unet_path
-    
+    # import correct text encoder class
+    text_encoder_cls = import_model_class_from_model_name_or_path(args.pretrained_model_name_or_path, args.revision)
+
     # Load scheduler and models
-    if args.model_type == "magic":
-        model = MagicClothingModel(
-            accelerator.device,
-            model_path=args.pretrained_model_name_or_path,
-            vit_path=args.vit_path
-            )
-    else:
-        raise NotImplementedError(f"Model type {args.model_type} not implemented")
+    noise_scheduler = UniPCMultistepScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    
+    text_encoder = text_encoder_cls.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
+    )
+    vae = AutoencoderKL.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
+    )
+    unet = UNet2DConditionModel.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
+    )
+    set_adapter(unet, "write")
+    
+    # A pipe that might not be used
+    pipe = StableDiffusionPipeline.from_pretrained(
+        args.pretrained_model_name_or_path, 
+        vae=vae, 
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        scheduler=noise_scheduler,
+        unet=unet,
+        torch_dtype=torch.float16
+    )
+    
+    # ref_unet initilization
+    ref_unet = copy.deepcopy(unet)
+    if ref_unet.config.in_channels == 9:
+        ref_unet.conv_in = torch.nn.Conv2d(4, 320, ref_unet.conv_in.kernel_size, ref_unet.conv_in.stride, ref_unet.conv_in.padding)
+        ref_unet.register_to_config(in_channels=4)
+    set_adapter(ref_unet, "read")
+    
+    
+    val_vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to(dtype=torch.float16)
+    val_pipe = StableDiffusionPipeline.from_pretrained(args.pretrained_model_name_or_path, vae=val_vae, torch_dtype=torch.float16)
+    val_pipe.scheduler = UniPCMultistepScheduler.from_config(val_pipe.scheduler.config)
+
+    full_net = ClothAdapter(val_pipe, None, accelerator.device, False, False, set_seg_model=False)
+    
+    # Taken from [Sayak Paul's Diffusers PR #6511](https://github.com/huggingface/diffusers/pull/6511/files)
+    def unwrap_model(model):
+        model = accelerator.unwrap_model(model)
+        model = model._orig_mod if is_compiled_module(model) else model
+        return model
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
@@ -730,36 +830,38 @@ def main(args):
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
 
+    vae.requires_grad_(False)
+    unet.requires_grad_(False)
+    text_encoder.requires_grad_(False)
+    ref_unet.train()
+
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
             import xformers
 
             xformers_version = version.parse(xformers.__version__)
             if xformers_version == version.parse("0.0.16"):
-                logger.warn(
+                logger.warning(
                     "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
                 )
-            model.full_net.ref_unet.enable_xformers_memory_efficient_attention()
-            model.full_net.pipe.unet.enable_xformers_memory_efficient_attention()
+            unet.enable_xformers_memory_efficient_attention()
+            ref_unet.enable_xformers_memory_efficient_attention()
         else:
             raise ValueError("xformers is not available. Make sure it is installed correctly")
 
-    # Taken from [Sayak Paul's Diffusers PR #6511](https://github.com/huggingface/diffusers/pull/6511/files)
-    def unwrap_model(model):
-        model = accelerator.unwrap_model(model)
-        model = model._orig_mod if is_compiled_module(model) else model
-        return model
-    
+    if args.gradient_checkpointing:
+        ref_unet.enable_gradient_checkpointing()
+
     # Check that all trainable models are in full precision
     low_precision_error_string = (
         " Please make sure to always have all model weights in full float32 precision when starting training - even if"
         " doing mixed precision training, copy of the weights should still be float32."
     )
 
-    # if unwrap_model(model.full_net.ref_unet).dtype != torch.float32:
-    #     raise ValueError(
-    #         f"Model loaded as datatype {unwrap_model(model.full_net.ref_unet).dtype}. {low_precision_error_string}"
-    #     )
+    if unwrap_model(ref_unet).dtype != torch.float32:
+        raise ValueError(
+            f"Controlnet loaded as datatype {unwrap_model(controlnet).dtype}. {low_precision_error_string}"
+        )
 
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
@@ -785,15 +887,7 @@ def main(args):
         optimizer_class = torch.optim.AdamW
 
     # Optimizer creation
-
-    
-    if args.gradient_checkpointing and args.gradient_checkpointing_garm:
-        params_to_optimize = list(model.full_net.pipe.unet.parameters())  + list(model.full_net.ref_unet.parameters())
-    elif args.gradient_checkpointing:
-        params_to_optimize = list(model.full_net.pipe.unet.parameters())
-    elif args.gradient_checkpointing_garm:
-        params_to_optimize = list(model.full_net.ref_unet.parameters())
-
+    params_to_optimize = ref_unet.parameters()
     optimizer = optimizer_class(
         params_to_optimize,
         lr=args.learning_rate,
@@ -802,13 +896,9 @@ def main(args):
         eps=args.adam_epsilon,
     )
 
-    if args.dataroot is None:
-        assert "Please provide correct data root"
     train_dataset = CPDataset(args.dataroot, args.resolution, mode="train", data_list=args.train_data_list)
     validation_dataset = CPDataset(args.dataroot, args.resolution, mode="train", data_list=args.validation_data_list)
-    test_dataset = CPDataset(args.dataroot, args.resolution, mode="test", data_list=args.test_data_list)
-    
-    
+
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         shuffle=True,
@@ -817,12 +907,6 @@ def main(args):
     )
     validation_dataloader = torch.utils.data.DataLoader(
         validation_dataset,
-        shuffle=True,
-        batch_size=args.train_batch_size,
-        num_workers=args.dataloader_num_workers,
-    )
-    test_dataloader = torch.utils.data.DataLoader(
-        test_dataset,
         shuffle=True,
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
@@ -844,31 +928,12 @@ def main(args):
         power=args.lr_power,
     )
 
-    model.vae.requires_grad_(False)
-    model.text_encoder.requires_grad_(False)
-    model.image_encoder.requires_grad_(False)
-    model.full_net.pipe.vae.requires_grad_(False)
-    
-    if args.gradient_checkpointing:
-        model.full_net.pipe.unet.train()
-        model.full_net.pipe.unet.enable_gradient_checkpointing()
-    else:
-        model.full_net.pipe.unet.requires_grad_(False)
-
-    if args.gradient_checkpointing_garm:
-        model.full_net.ref_unet.train()
-        model.full_net.ref_unet.enable_gradient_checkpointing()
-    else:
-        model.full_net.ref_unet.requires_grad_(False)
-    
-    
-
     # Prepare everything with our `accelerator`.
-    model.full_net.ref_unet, model.vae, model.full_net.pipe.vae, model.full_net.pipe.unet, optimizer, train_dataloader, test_dataloader, lr_scheduler = accelerator.prepare(
-        model.full_net.ref_unet, model.vae, model.full_net.pipe.vae, model.full_net.pipe.unet, optimizer, train_dataloader, test_dataloader, lr_scheduler
+    ref_unet, optimizer, train_dataloader, validation_dataloader, lr_scheduler = accelerator.prepare(
+        ref_unet, optimizer, train_dataloader, validation_dataloader, lr_scheduler
     )
 
-    # For mixed precision training we cast untrained weights to half-precision
+    # For mixed precision training we cast the text_encoder and vae weights to half-precision
     # as these models are only used for inference, keeping weights in full precision is not required.
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
@@ -876,12 +941,10 @@ def main(args):
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
 
-    model.vae.to(accelerator.device, dtype=weight_dtype)
-    model.full_net.pipe.vae.to(accelerator.device, dtype=weight_dtype)
-    model.text_encoder.to(accelerator.device, dtype=weight_dtype)
-
-    model.full_net.ref_unet.to(accelerator.device)
-    model.full_net.pipe.unet.to(accelerator.device)
+    # Move vae, unet and text_encoder to device and cast to weight_dtype
+    vae.to(accelerator.device, dtype=weight_dtype)
+    unet.to(accelerator.device, dtype=weight_dtype)
+    text_encoder.to(accelerator.device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -944,34 +1007,41 @@ def main(args):
         # Only show the progress bar once on each machine.
         disable=not accelerator.is_local_main_process,
     )
-
-    image_logs = None
-    unet_grad_dict = defaultdict(list)
-    unet_gram_grad_dict = defaultdict(list)
-    vae_grad_dict = defaultdict(list)
-
-    # pre-train validation
-    log_validation(model, args, accelerator, weight_dtype, test_dataloader, validation_dataloader)
     
-    # training starts!
+    image_logs = None
+    
+    # pre-train validation
+    log_validation(ref_unet, full_net, auto_processor, image_encoder, pipe, args, accelerator, weight_dtype, validation_dataloader)
+    
+    attn_store = {}
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
-            with torch.autocast("cuda"):
+            with accelerator.accumulate(ref_unet):
+                # Convert images to latent space
                 image_garm = batch["ref_imgs"]
-                image_vton = batch["inpaint_image"]
                 image_ori = batch["GT"]
-                inpaint_mask = batch["inpaint_mask"]
-                mask = batch["mask"] # mask will not be used in trainning
                 prompt = batch["prompt"]
-                                
-                prompt_image = model.auto_processor(images=image_garm, return_tensors="pt").to(accelerator.device)
-                prompt_image = model.image_encoder(prompt_image.data['pixel_values']).image_embeds
+                
+                # Get the text embedding for conditioning
+                # This is for stable diffusion pipeline
+                encoder_hidden_states, negative_prompt_embeds = pipe.encode_prompt(
+                    prompt,
+                    device=accelerator.device,
+                    num_images_per_prompt=1,
+                    do_classifier_free_guidance=True,
+                    negative_prompt=["monochrome, lowres, bad anatomy, worst quality, low quality"] * args.train_batch_size,
+                )
+                
+                # prepare the embeddings for ref_unet
+                
+                prompt_image = auto_processor(images=image_garm, return_tensors="pt").to(accelerator.device)
+                prompt_image = image_encoder(prompt_image.data['pixel_values']).image_embeds
                 prompt_image = prompt_image.unsqueeze(1)
-                prompt_embeds = model.text_encoder(model.tokenize_captions(prompt, 2).to(accelerator.device))[0]
+                prompt_embeds = text_encoder(tokenize_captions(tokenizer, ([""] * args.train_batch_size), 2).to(accelerator.device))[0]
 
                 prompt_embeds[:, 1:] = prompt_image[:]
                 
-                prompt_embeds = model._encode_prompt(
+                prompt_embeds_ref_unet = pipe.encode_prompt(
                     prompt=prompt,
                     device=accelerator.device,
                     num_images_per_prompt=1,
@@ -979,124 +1049,64 @@ def main(args):
                     prompt_embeds=prompt_embeds
                 )
                 
-                image_garm = model.image_processor.preprocess(image_garm)
-                image_vton = model.image_processor.preprocess(image_vton)
-                image_ori = model.image_processor.preprocess(image_ori)
-                mask = mask.unsqueeze(dim=1)
-                    
-                # Convert images to latent space
-                garm_latents = model.prepare_garm_latents(
-                    image=image_garm,
-                    batch_size=args.train_batch_size,
-                    num_images_per_prompt=1,
-                    dtype=prompt_embeds.dtype,
-                    device=accelerator.device,
-                    do_classifier_free_guidance=False,
-                )
+                ###Latent part
                 
-                vton_latents, mask_latents, ori_latents = model.prepare_vton_latents(
-                    image=image_vton,
-                    mask=mask,
-                    image_ori=image_ori,
-                    batch_size=args.train_batch_size,
-                    num_images_per_prompt=1,
-                    dtype=prompt_embeds.dtype,
-                    device=accelerator.device,
-                    do_classifier_free_guidance=False,
-                )
-
-                # TODO: why do we need to use sample() instead of mode()
-                latents = model.vae.encode(image_ori).latent_dist.sample()
-                # latents = vae.encode(image_ori.to(weight_dtype).latent_dist.sample().to(accelerator.device))
-                latents = latents * model.vae.config.scaling_factor
-                garm_latents = garm_latents * model.vae.config.scaling_factor
+                image_garm = pipe.image_processor.preprocess(image_garm)
+                image_ori = pipe.image_processor.preprocess(image_ori)
+                
+                latents = vae.encode(image_ori.to(dtype=weight_dtype)).latent_dist.sample()
+                latents = latents * vae.config.scaling_factor
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
                 # Sample a random timestep for each image
-                timesteps = torch.randint(0, model.scheduler.config.num_train_timesteps, (bsz,), device=accelerator.device)
+                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
                 timesteps = timesteps.long()
 
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
-                noisy_latents = model.scheduler.add_noise(latents, noise, timesteps)
-                attn_store = {}
-                model.full_net.ref_unet(garm_latents, 0, prompt_embeds, cross_attention_kwargs={"attn_store": attn_store})
+                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
                 
-                # latent_vton_model_input = torch.cat([noisy_latents, vton_latents], dim=1)
-            
+                # Garment latent
+                garm_latents = vae.encode(image_garm).latent_dist.mode()
+                garm_latents = torch.cat([garm_latents], dim=0)
+                garm_latents = garm_latents * vae.config.scaling_factor
                 
-                # predict the noise residual
-                timestep_cond = None
-                noise_pred = model.full_net.pipe.unet(
+                ref_unet(garm_latents, 0, prompt_embeds_ref_unet, cross_attention_kwargs={"attn_store": attn_store})
+
+                # Predict the noise residual
+                model_pred = unet(
                     noisy_latents,
                     timesteps,
-                    encoder_hidden_states=prompt_embeds,
-                    timestep_cond=timestep_cond,
-                    cross_attention_kwargs={"attn_store": attn_store},
+                    encoder_hidden_states=encoder_hidden_states,
                     return_dict=False,
+                    cross_attention_kwargs={"attn_store": attn_store},
                 )[0]
-                
-                
-                loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
-                # TODO: Are these latents x0 or xt-1?
-                # Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
-                # extra_step_kwargs = model.prepare_extra_step_kwargs(generator, args.eta)
-                # compute the previous noisy sample x_t -> x_t-1
-                # latents = model.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
-                
-                accelerator.backward(loss)
-                # TODO: Do we need to clip gradients?
-                if accelerator.sync_gradients:
-                    if args.clip_grad_norm:
-                        accelerator.clip_grad_norm_(model.full_net.ref_unet.parameters(), args.max_grad_norm)
-                        # accelerator.clip_grad_norm_(model.vae.parameters(), args.max_grad_norm)  
-                
-                
-                if args.log_grads:
-                    if model.full_net.ref_unet.training:
-                        for name, block in model.full_net.ref_unet.named_children():
-                            grad = torch.tensor(0.0).to(accelerator.device)
-                            for p in block.parameters():
-                                if p.grad is not None:
-                                    grad += p.grad.norm()
-                                    # grad += p.grad.abs().max()
-                            unet_gram_grad_dict[name+'.grad.norm'] = grad.detach().item()
-                        accelerator.log(unet_gram_grad_dict, step=global_step)
-                    
-                    if model.full_net.pipe.unet.training:
-                        for name, block in model.full_net.pipe.unet.named_children():
-                            grad = torch.tensor(0.0).to(accelerator.device)
-                            for p in block.parameters():
-                                if p.grad is not None:
-                                    grad += p.grad.norm()
-                            unet_grad_dict[name+'.grad'] = grad.detach().item()
-                        accelerator.log(unet_grad_dict, step=global_step)
-                    
-                    if model.vae.training:
-                        for name, block in model.vae.named_children():
-                            grad = torch.tensor(0.0).to(accelerator.device)
-                            for p in block.parameters():
-                                if p.grad is not None:
-                                    grad += p.grad.norm()
-                            vae_grad_dict[name+'.grad'] = grad.detach().item()
-                        accelerator.log(vae_grad_dict, step=global_step)
 
-                
+                # Get the target for loss depending on the prediction type
+                if noise_scheduler.config.prediction_type == "epsilon":
+                    target = noise
+                elif noise_scheduler.config.prediction_type == "v_prediction":
+                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                else:
+                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+
+                accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    params_to_clip = controlnet.parameters()
+                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=args.set_grads_to_none)
-                
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
-                
 
                 if accelerator.is_main_process:
-                    # Save the checkpoint
                     if global_step % args.checkpointing_steps == 0:
                         # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
                         if args.checkpoints_total_limit is not None:
@@ -1121,51 +1131,34 @@ def main(args):
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
-                        
-                        unet_vton = unwrap_model(model.full_net.pipe.unet)
-                        unet_vton.save_pretrained(f"{args.output_dir}/checkpoint-{global_step}/unet_vton", safe_serialization=True)
-                        
-                        unet_garm = unwrap_model(model.full_net.ref_unet)
-                        unet_garm.save_pretrained(f"{args.output_dir}/checkpoint-{global_step}/unet_garm", safe_serialization=True)
 
                     if global_step % args.validation_steps == 0:
                         log_validation(
-                            model,
+                            ref_unet,
+                            full_net,
+                            auto_processor,
+                            image_encoder,
+                            pipe,
                             args,
                             accelerator,
                             weight_dtype,
-                            test_dataloader,
                             validation_dataloader,
                         )
-
+                        
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
             if global_step >= args.max_train_steps:
                 break
-    
-    #Create the pipeline using the trained modules and save it.
+
+    # Create the pipeline using using the trained modules and save it.
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        unet_vton = unwrap_model(model.full_net.pipe.unet)
-        unet_vton.save_pretrained(args.output_dir+"/unet_vton", safe_serialization=True)
-        
-        unet_garm = unwrap_model(model.full_net.ref_unet)
-        unet_garm.save_pretrained(args.output_dir+"/unet_garm", safe_serialization=True)
+        controlnet = unwrap_model(controlnet)
+        controlnet.save_pretrained(args.output_dir)
 
         # Run a final round of validation.
-        image_logs = None
-        if args.validation_prompt is not None:
-            image_logs = log_validation(
-                model,
-                args,
-                accelerator,
-                weight_dtype,
-                test_dataloader,
-                validation_dataloader,
-            )
-
         if args.push_to_hub:
             save_model_card(
                 repo_id,
