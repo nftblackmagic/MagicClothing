@@ -23,6 +23,7 @@ import random
 import shutil
 import copy
 from pathlib import Path
+from collections import defaultdict
 
 import accelerate
 import numpy as np
@@ -40,6 +41,7 @@ from PIL import Image
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig, AutoProcessor, CLIPVisionModelWithProjection
+from safetensors import safe_open
 
 import diffusers
 from diffusers import (
@@ -59,6 +61,7 @@ from diffusers.pipelines import StableDiffusionPipeline
 from utils.utils import is_torch2_available, prepare_image, prepare_mask
 from cp_dataset import CPDatasetV2 as CPDataset
 from garment_adapter.garment_diffusion import ClothAdapter
+from pipelines.OmsDiffusionPipeline import OmsDiffusionPipeline
 
 
 if is_torch2_available():
@@ -662,6 +665,12 @@ def parse_args(input_args=None):
         help="if clip the gradients' norm by max_grad_norm"
     )
     
+    parser.add_argument(
+        "--ref_path",
+        type=str,
+        default=None,
+    )
+    
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -769,7 +778,7 @@ def main(args):
     set_adapter(unet, "write")
     
     # A pipe that might not be used
-    pipe = StableDiffusionPipeline.from_pretrained(
+    pipe = OmsDiffusionPipeline.from_pretrained(
         args.pretrained_model_name_or_path, 
         vae=vae, 
         text_encoder=text_encoder,
@@ -781,17 +790,24 @@ def main(args):
     
     # ref_unet initilization
     ref_unet = copy.deepcopy(unet)
+    set_adapter(ref_unet, "read")
+
     if ref_unet.config.in_channels == 9:
         ref_unet.conv_in = torch.nn.Conv2d(4, 320, ref_unet.conv_in.kernel_size, ref_unet.conv_in.stride, ref_unet.conv_in.padding)
         ref_unet.register_to_config(in_channels=4)
-    set_adapter(ref_unet, "read")
     
+    if args.ref_path is not None:
+        state_dict = {}
+        with safe_open(args.ref_path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                state_dict[key] = f.get_tensor(key)
+        ref_unet.load_state_dict(state_dict, strict=False)
     
     val_vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to(dtype=torch.float16)
-    val_pipe = StableDiffusionPipeline.from_pretrained(args.pretrained_model_name_or_path, vae=val_vae, torch_dtype=torch.float16)
+    val_pipe = OmsDiffusionPipeline.from_pretrained(args.pretrained_model_name_or_path, vae=val_vae, torch_dtype=torch.float16)
     val_pipe.scheduler = UniPCMultistepScheduler.from_config(val_pipe.scheduler.config)
 
-    full_net = ClothAdapter(val_pipe, None, accelerator.device, False, False, set_seg_model=False)
+    full_net = ClothAdapter(val_pipe, None, accelerator.device, True, False, set_seg_model=False)
     
     # Taken from [Sayak Paul's Diffusers PR #6511](https://github.com/huggingface/diffusers/pull/6511/files)
     def unwrap_model(model):
@@ -1014,6 +1030,8 @@ def main(args):
     log_validation(ref_unet, full_net, auto_processor, image_encoder, pipe, args, accelerator, weight_dtype, validation_dataloader)
     
     attn_store = {}
+    ref_unet_grad_dict = defaultdict(list)
+    
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(ref_unet):
@@ -1029,7 +1047,7 @@ def main(args):
                     device=accelerator.device,
                     num_images_per_prompt=1,
                     do_classifier_free_guidance=True,
-                    negative_prompt=["monochrome, lowres, bad anatomy, worst quality, low quality"] * args.train_batch_size,
+                    negative_prompt=["monochrome, lowres, bad anatomy, worst quality, low quality"] * len(prompt),
                 )
                 
                 # prepare the embeddings for ref_unet
@@ -1037,11 +1055,11 @@ def main(args):
                 prompt_image = auto_processor(images=image_garm, return_tensors="pt").to(accelerator.device)
                 prompt_image = image_encoder(prompt_image.data['pixel_values']).image_embeds
                 prompt_image = prompt_image.unsqueeze(1)
-                prompt_embeds = text_encoder(tokenize_captions(tokenizer, ([""] * args.train_batch_size), 2).to(accelerator.device))[0]
+                prompt_embeds = text_encoder(tokenize_captions(tokenizer, ([""] * len(prompt)), 2).to(accelerator.device))[0]
 
                 prompt_embeds[:, 1:] = prompt_image[:]
                 
-                prompt_embeds_ref_unet = pipe.encode_prompt(
+                prompt_embeds_ref_unet, _ = pipe.encode_prompt(
                     prompt=prompt,
                     device=accelerator.device,
                     num_images_per_prompt=1,
@@ -1061,7 +1079,7 @@ def main(args):
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
                 # Sample a random timestep for each image
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=accelerator.device)
                 timesteps = timesteps.long()
 
                 # Add noise to the latents according to the noise magnitude at each timestep
@@ -1069,11 +1087,16 @@ def main(args):
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
                 
                 # Garment latent
-                garm_latents = vae.encode(image_garm).latent_dist.mode()
+                garm_latents = vae.encode(image_garm.to(dtype=weight_dtype)).latent_dist.mode()
                 garm_latents = torch.cat([garm_latents], dim=0)
                 garm_latents = garm_latents * vae.config.scaling_factor
                 
-                ref_unet(garm_latents, 0, prompt_embeds_ref_unet, cross_attention_kwargs={"attn_store": attn_store})
+                ref_unet(
+                    garm_latents, 
+                    0, 
+                    prompt_embeds_ref_unet, 
+                    cross_attention_kwargs={"attn_store": attn_store}
+                )
 
                 # Predict the noise residual
                 model_pred = unet(
@@ -1081,7 +1104,7 @@ def main(args):
                     timesteps,
                     encoder_hidden_states=encoder_hidden_states,
                     return_dict=False,
-                    cross_attention_kwargs={"attn_store": attn_store},
+                    cross_attention_kwargs={"attn_store": attn_store, "enable_cloth_guidance": False},
                 )[0]
 
                 # Get the target for loss depending on the prediction type
@@ -1095,8 +1118,20 @@ def main(args):
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    params_to_clip = controlnet.parameters()
+                    params_to_clip = ref_unet.parameters()
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                
+                if args.log_grads:
+                    if ref_unet.training:
+                        for name, block in ref_unet.named_children():
+                            grad = torch.tensor(0.0).to(accelerator.device)
+                            for p in block.parameters():
+                                if p.grad is not None:
+                                    grad += p.grad.norm()
+                                    # grad += p.grad.abs().max()
+                            ref_unet_grad_dict[name+'.grad.norm'] = grad.detach().item()
+                        accelerator.log(ref_unet_grad_dict, step=global_step)
+                
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=args.set_grads_to_none)

@@ -16,3 +16,5 @@ unzip ./data/VITON-HD/test/test_cloth_caption.zip -d ./data/VITON-HD/test/
 
 aws s3 cp s3://ec2-sd-images/ootd_weight/checkpoint-2000.zip ./checkpoints
 tar -xvzf  ./checkpoints/checkpoint-2000.zip -C ./checkpoints/
+
+aria2c --console-log-level=error -c -x 16 -s 16 -k 1M https://huggingface.co/ShineChen1024/MagicClothing/resolve/main/magic_clothing_768_vitonhd_joint.safetensors  -d ./data -o ref_unet.safetensors
