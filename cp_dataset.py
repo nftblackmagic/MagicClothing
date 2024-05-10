@@ -513,6 +513,7 @@ class CPDatasetV2(CPDataset):
             "inpaint_image": agnostic,
             "inpaint_mask": inpaint_mask,
             "mask": mask,
+            "cloth_mask": cm[key],
             "ref_imgs": ref_image,
             "file_name": self.im_names[index],
             "cloth_path": cloth_path,

@@ -141,7 +141,7 @@ class ClothAdapter:
 
         cloth = prepare_image(cloth_image, height, width)
         cloth_mask = prepare_mask(cloth_mask_image, height, width)
-        cloth = (cloth * cloth_mask).to(self.device, dtype=torch.float16)
+        cloth = (cloth).to(self.device, dtype=torch.float16)
 
         with torch.inference_mode():
             prompt_embeds_null = self.pipe.encode_prompt([""], device=self.device, num_images_per_prompt=num_images_per_prompt, do_classifier_free_guidance=False)[0]

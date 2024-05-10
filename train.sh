@@ -12,7 +12,7 @@ accelerate launch train.py \
     --checkpointing_steps="1000" \
     --use_8bit_adam \
     --gradient_checkpointing_garm \
-    --validation_steps="100" \
+    --validation_steps="20" \
     --inference_steps="50" \
     --log_grads \
     --report_to="wandb"\

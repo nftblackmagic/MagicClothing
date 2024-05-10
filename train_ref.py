@@ -183,9 +183,9 @@ def image_grid(imgs, rows, cols):
 def log_validation(ref_unet, full_net, auto_processor, image_encoder, pipe, args, accelerator, weight_dtype, validation_dataloader = None):
     logger.info("Running validation... ")
     
-    ref_unet = accelerator.unwrap_model(ref_unet)
+    new_ref_unet = accelerator.unwrap_model(ref_unet)
     
-    full_net.ref_unet = ref_unet
+    full_net.ref_unet = copy.deepcopy(new_ref_unet)
     # images = full_net.generate(cloth_image)
     
     def sample_imgs(data_loader, log_key: str):
@@ -198,10 +198,10 @@ def log_validation(ref_unet, full_net, auto_processor, image_encoder, pipe, args
                     image_vton = batch["inpaint_image"][0, :]
                     image_ori= batch["GT"][0, :]
                     inpaint_mask = batch["inpaint_mask"][0, :]
-                    mask = batch["mask"][0, :].unsqueeze(0)
+                    cloth_mask = batch["cloth_mask"][0, :].unsqueeze(0)
                     cloth_path = batch["cloth_path"][0]
 
-                    samples = full_net.generate(cloth_image=image_garm, cloth_mask_image=mask, prompt=prompt, width=512)
+                    samples = full_net.generate(cloth_image=image_garm, cloth_mask_image=cloth_mask, prompt=prompt, width=512, seed=args.seed,num_inference_steps=args.inference_steps)
                     
                     image_logs.append({
                         "garment": image_garm, 
@@ -210,7 +210,7 @@ def log_validation(ref_unet, full_net, auto_processor, image_encoder, pipe, args
                         "samples": samples[0][0], 
                         "prompt": prompt,
                         "inpaint mask": inpaint_mask,
-                        "mask": mask
+                        "mask": cloth_mask
                         })
 
         for tracker in accelerator.trackers:
@@ -218,9 +218,9 @@ def log_validation(ref_unet, full_net, auto_processor, image_encoder, pipe, args
                 formatted_images = []
                 for log in image_logs:
                     formatted_images.append(wandb.Image(log["garment"], caption="garment images"))
-                    formatted_images.append(wandb.Image(log["model"], caption="masked model images"))
+                    # formatted_images.append(wandb.Image(log["model"], caption="masked model images"))
                     formatted_images.append(wandb.Image(log["orig_img"], caption="original images"))
-                    formatted_images.append(wandb.Image(log["inpaint mask"], caption="inpaint mask"))
+                    # formatted_images.append(wandb.Image(log["inpaint mask"], caption="inpaint mask"))
                     formatted_images.append(wandb.Image(log["mask"], caption="mask"))
                     formatted_images.append(wandb.Image(log["samples"], caption=log["prompt"]))
                 tracker.log({log_key: formatted_images})
@@ -790,7 +790,6 @@ def main(args):
     
     # ref_unet initilization
     ref_unet = copy.deepcopy(unet)
-    set_adapter(ref_unet, "read")
 
     if ref_unet.config.in_channels == 9:
         ref_unet.conv_in = torch.nn.Conv2d(4, 320, ref_unet.conv_in.kernel_size, ref_unet.conv_in.stride, ref_unet.conv_in.padding)
@@ -802,6 +801,9 @@ def main(args):
             for key in f.keys():
                 state_dict[key] = f.get_tensor(key)
         ref_unet.load_state_dict(state_dict, strict=False)
+    
+    set_adapter(ref_unet, "read")
+    attn_store = {}
     
     val_vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to(dtype=torch.float16)
     val_pipe = OmsDiffusionPipeline.from_pretrained(args.pretrained_model_name_or_path, vae=val_vae, torch_dtype=torch.float16)
@@ -961,6 +963,7 @@ def main(args):
     vae.to(accelerator.device, dtype=weight_dtype)
     unet.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
+    ref_unet.to(accelerator.device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -1029,7 +1032,7 @@ def main(args):
     # pre-train validation
     log_validation(ref_unet, full_net, auto_processor, image_encoder, pipe, args, accelerator, weight_dtype, validation_dataloader)
     
-    attn_store = {}
+    
     ref_unet_grad_dict = defaultdict(list)
     
     for epoch in range(first_epoch, args.num_train_epochs):
@@ -1040,32 +1043,20 @@ def main(args):
                 image_ori = batch["GT"]
                 prompt = batch["prompt"]
                 
+                # image_garm = prepare_image(image_garm, 512, 512)
+                
                 # Get the text embedding for conditioning
                 # This is for stable diffusion pipeline
-                encoder_hidden_states, negative_prompt_embeds = pipe.encode_prompt(
-                    prompt,
-                    device=accelerator.device,
-                    num_images_per_prompt=1,
-                    do_classifier_free_guidance=True,
-                    negative_prompt=["monochrome, lowres, bad anatomy, worst quality, low quality"] * len(prompt),
-                )
+                # encoder_hidden_states, negative_prompt_embeds = pipe.encode_prompt(
+                #     prompt,
+                #     device=accelerator.device,
+                #     num_images_per_prompt=1,
+                #     do_classifier_free_guidance=False,
+                #     negative_prompt=["monochrome, lowres, bad anatomy, worst quality, low quality"] * len(prompt),
+                # )
                 
-                # prepare the embeddings for ref_unet
-                
-                prompt_image = auto_processor(images=image_garm, return_tensors="pt").to(accelerator.device)
-                prompt_image = image_encoder(prompt_image.data['pixel_values']).image_embeds
-                prompt_image = prompt_image.unsqueeze(1)
-                prompt_embeds = text_encoder(tokenize_captions(tokenizer, ([""] * len(prompt)), 2).to(accelerator.device))[0]
-
-                prompt_embeds[:, 1:] = prompt_image[:]
-                
-                prompt_embeds_ref_unet, _ = pipe.encode_prompt(
-                    prompt=prompt,
-                    device=accelerator.device,
-                    num_images_per_prompt=1,
-                    do_classifier_free_guidance=False,
-                    prompt_embeds=prompt_embeds
-                )
+                encoder_hidden_states = text_encoder(tokenize_captions(tokenizer, prompt, 2).to(accelerator.device), return_dict=False)[0]
+                prompt_embeds_null = text_encoder(tokenize_captions(tokenizer,[""] * len(prompt), 2).to(accelerator.device), return_dict=False)[0]
                 
                 ###Latent part
                 
@@ -1088,14 +1079,14 @@ def main(args):
                 
                 # Garment latent
                 garm_latents = vae.encode(image_garm.to(dtype=weight_dtype)).latent_dist.mode()
-                garm_latents = torch.cat([garm_latents], dim=0)
                 garm_latents = garm_latents * vae.config.scaling_factor
-                
+                garm_latents = torch.cat([garm_latents])
+                                
                 ref_unet(
                     garm_latents, 
                     0, 
-                    prompt_embeds_ref_unet, 
-                    cross_attention_kwargs={"attn_store": attn_store}
+                    prompt_embeds_null, 
+                    cross_attention_kwargs={"attn_store": attn_store, "do_classifier_free_guidance": False ,"enable_cloth_guidance": False}
                 )
 
                 # Predict the noise residual
@@ -1104,7 +1095,7 @@ def main(args):
                     timesteps,
                     encoder_hidden_states=encoder_hidden_states,
                     return_dict=False,
-                    cross_attention_kwargs={"attn_store": attn_store, "enable_cloth_guidance": False},
+                    cross_attention_kwargs={"attn_store": attn_store, "do_classifier_free_guidance": False, "enable_cloth_guidance": False},
                 )[0]
 
                 # Get the target for loss depending on the prediction type
