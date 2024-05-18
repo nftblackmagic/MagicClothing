@@ -21,7 +21,7 @@ class ClothAdapter:
         self.use_independent_condition = use_independent_condition
         self.device = device
         self.pipe = sd_pipe.to(self.device)
-        self.set_adapter(self.pipe.unet, "write")
+        # self.set_adapter(self.pipe.unet, "write")
 
         ref_unet = copy.deepcopy(sd_pipe.unet)
         if ref_unet.config.in_channels == 9:
@@ -74,7 +74,7 @@ class ClothAdapter:
 
         cloth = prepare_image(cloth_image, height, width)
         cloth_mask = prepare_mask(cloth_mask_image, height, width)
-        cloth = (cloth * cloth_mask).to(self.device, dtype=torch.float16)
+        cloth = (cloth).to(self.device, dtype=torch.float16)
 
         if prompt is None:
             prompt = "a photography of a model"
@@ -118,7 +118,7 @@ class ClothAdapter:
                 generator=generator,
                 height=height,
                 width=width,
-                cross_attention_kwargs={"attn_store": self.attn_store, "do_classifier_free_guidance": guidance_scale > 1.0, "enable_cloth_guidance": self.enable_cloth_guidance, "use_independent_condition": self.use_independent_condition},
+                # cross_attention_kwargs={"attn_store": self.attn_store, "do_classifier_free_guidance": guidance_scale > 1.0, "enable_cloth_guidance": self.enable_cloth_guidance, "use_independent_condition": self.use_independent_condition},
                 **kwargs,
             ).images
 
