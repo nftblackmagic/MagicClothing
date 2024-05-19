@@ -131,6 +131,7 @@ def log_validation(ref_unet, full_net, unet, auto_processor, image_encoder, pipe
                         prompt=prompt, 
                         width=512, 
                         seed=args.seed,num_inference_steps=args.inference_steps,
+                        num_images_per_prompt=1,
                     )
                     
                     image_logs.append({
@@ -705,7 +706,7 @@ def main(args):
     unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
     )
-    # set_adapter(unet, "write")
+    set_adapter(unet, "write")
     
     # A pipe that might not be used
     pipe = StableDiffusionPipeline.from_pretrained(

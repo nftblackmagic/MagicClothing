@@ -91,7 +91,10 @@ class ClothAdapter:
                 negative_prompt=negative_prompt,
             )
             prompt_embeds_null = self.pipe.encode_prompt([""], device=self.device, num_images_per_prompt=num_images_per_prompt, do_classifier_free_guidance=False)[0]
+            print("prompt_embeds_null:",prompt_embeds_null.shape)
+            print("prompt_embeds:",prompt_embeds.shape)
             cloth_embeds = self.pipe.vae.encode(cloth).latent_dist.mode() * self.pipe.vae.config.scaling_factor
+            print("cloth_embeds:",cloth_embeds.shape)
             self.ref_unet(torch.cat([cloth_embeds] * num_images_per_prompt), 0, prompt_embeds_null, cross_attention_kwargs={"attn_store": self.attn_store})
         if seed == -1:
             seed = None
@@ -118,7 +121,7 @@ class ClothAdapter:
                 generator=generator,
                 height=height,
                 width=width,
-                # cross_attention_kwargs={"attn_store": self.attn_store, "do_classifier_free_guidance": guidance_scale > 1.0, "enable_cloth_guidance": self.enable_cloth_guidance, "use_independent_condition": self.use_independent_condition},
+                cross_attention_kwargs={"attn_store": self.attn_store, "do_classifier_free_guidance": guidance_scale > 1.0, "enable_cloth_guidance": self.enable_cloth_guidance, "use_independent_condition": self.use_independent_condition},
                 **kwargs,
             ).images
 

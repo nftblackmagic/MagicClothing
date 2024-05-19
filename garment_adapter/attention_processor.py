@@ -290,8 +290,10 @@ class REFAttnProcessor2_0(nn.Module):
     ) -> torch.FloatTensor:
         if self.type == "read":
             attn_store[self.name] = hidden_states
+            # print("attn_store.shape",hidden_states.shape, self.name)
         elif self.type == "write":
             ref_hidden_states = attn_store[self.name]
+            # print("ref_hidden_states.shape before",ref_hidden_states.shape, self.name, do_classifier_free_guidance)
             if do_classifier_free_guidance:
                 empty_copy = torch.zeros_like(ref_hidden_states)
                 if enable_cloth_guidance:
@@ -301,6 +303,8 @@ class REFAttnProcessor2_0(nn.Module):
                         ref_hidden_states = torch.cat([empty_copy, ref_hidden_states, ref_hidden_states])
                 else:
                     ref_hidden_states = torch.cat([empty_copy, ref_hidden_states])
+            # print("hidden_states.shape",hidden_states.shape, self.name)
+            # print("ref_hidden_states.shape",ref_hidden_states.shape, self.name)
             hidden_states = torch.cat([hidden_states, ref_hidden_states], dim=1)
         else:
             raise ValueError("unsupport type")
