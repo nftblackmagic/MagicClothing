@@ -152,6 +152,8 @@ More information on all the CLI arguments and the environment are available on y
 
 def log_validation(vae, text_encoder, tokenizer, unet, ref_unet, args, accelerator, weight_dtype, epoch, validation_dataloader):
     logger.info("Running validation... ")
+    
+    ref_unet = accelerator.unwrap_model(ref_unet)
 
     pipeline = StableDiffusionPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
@@ -186,7 +188,7 @@ def log_validation(vae, text_encoder, tokenizer, unet, ref_unet, args, accelerat
                 with torch.autocast("cuda"):
                     prompt = batch["prompt"][0]
                     image_garm = batch["ref_imgs"][0, :]
-                    guidance_scale = 7.5
+                    guidance_scale = 0.1
                     
                     image_garm = image_processor.preprocess(image_garm).to(accelerator.device, dtype=weight_dtype)
                     print("prompt:",prompt)
@@ -374,6 +376,11 @@ def parse_args():
     )
     parser.add_argument(
         "--gradient_checkpointing",
+        action="store_true",
+        help="Whether or not to use gradient checkpointing to save memory at the expense of slower backward pass.",
+    )
+    parser.add_argument(
+        "--ref_unet_gradient_checkpointing",
         action="store_true",
         help="Whether or not to use gradient checkpointing to save memory at the expense of slower backward pass.",
     )
@@ -588,6 +595,12 @@ def parse_args():
         type=str,
         default=None,
     )
+    parser.add_argument(
+        "--conditioning_dropout_prob",
+        type = float,
+        default=0.1,
+        
+    )
     
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -733,8 +746,16 @@ def main():
     # Freeze vae and text_encoder and set unet to trainable
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
-    ref_unet.requires_grad_(False)
-    unet.train()
+    if args.gradient_checkpointing:
+        unet.train()
+    else:
+        unet.requires_grad_(False)
+    
+    if args.ref_unet_gradient_checkpointing:
+        ref_unet.train()
+    else:
+        ref_unet.requires_grad_(False)
+    
 
     # Create EMA for the unet.
     if args.use_ema:
@@ -794,6 +815,9 @@ def main():
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
 
+    if args.ref_unet_gradient_checkpointing:
+        ref_unet.enable_gradient_checkpointing()
+
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
     if args.allow_tf32:
@@ -817,8 +841,10 @@ def main():
     else:
         optimizer_cls = torch.optim.AdamW
 
+    # TODO: 
+    params_to_optimize = list(ref_unet.parameters()) + list(unet.parameters())
     optimizer = optimizer_cls(
-        unet.parameters(),
+        params_to_optimize,
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -878,7 +904,9 @@ def main():
     text_encoder.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
     
-    ref_unet.to(accelerator.device, dtype=weight_dtype)
+    # TODO:
+    ref_unet.to(accelerator.device)
+    unet.to(accelerator.device)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -976,11 +1004,12 @@ def main():
     )
         
     unet_grad_dict = defaultdict(list)
+    ref_unet_grad_dict = defaultdict(list)
     attn_store = {}
     for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
-            with accelerator.accumulate(unet):
+            with torch.autocast("cuda"):
                 prompt = batch["prompt"]
                 image_ori = batch["GT"]
                 image_garm = batch["ref_imgs"]
@@ -997,13 +1026,13 @@ def main():
                 if args.noise_offset:
                     # https://www.crosslabs.org//blog/diffusion-with-offset-noise
                     noise += args.noise_offset * torch.randn(
-                        (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
+                        (latents.shape[0], latents.shape[1], 1, 1), device=accelerator.device
                     )
                 if args.input_perturbation:
                     new_noise = noise + args.input_perturbation * torch.randn_like(noise)
                 bsz = latents.shape[0]
                 # Sample a random timestep for each image
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=accelerator.device)
                 timesteps = timesteps.long()
 
                 # Add noise to the latents according to the noise magnitude at each timestep
@@ -1018,7 +1047,24 @@ def main():
 
                 prompt_embeds_null = text_encoder(tokenize_captions([""]* len(prompt)).to(accelerator.device), return_dict=False)[0]
                 cloth_embeds = vae.encode(image_garm).latent_dist.mode() * vae.config.scaling_factor
-                ref_unet(torch.cat([cloth_embeds]), 0, prompt_embeds_null, cross_attention_kwargs={"attn_store": attn_store})
+                image_latents_garm = torch.cat([cloth_embeds])
+                #####  modify: we should dropout the cloth condition! ##########      
+                if args.conditioning_dropout_prob is not None:
+                    random_p = torch.rand(bsz, device=accelerator.device)
+                    #########################################################
+
+                    # Sample masks for the cloth images.
+                    image_mask_dtype = image_latents_garm.dtype
+                    image_mask = 1 - (
+                        (random_p >= args.conditioning_dropout_prob).to(image_mask_dtype)
+                        * (random_p < 3 * args.conditioning_dropout_prob).to(image_mask_dtype)
+                    )
+                    image_mask = image_mask.reshape(bsz, 1, 1, 1)
+                    # Final image conditioning.
+                    image_latents_garm = image_mask * image_latents_garm
+                ####################################################################
+
+                ref_unet(image_latents_garm, 0, prompt_embeds_null, cross_attention_kwargs={"attn_store": attn_store})
                 
                 # Get the target for loss depending on the prediction type
                 if args.prediction_type is not None:
@@ -1089,9 +1135,19 @@ def main():
                                     # grad += p.grad.abs().max()
                             unet_grad_dict[name+'.grad'] = grad.detach().item()
                         accelerator.log(unet_grad_dict, step=global_step)
-                
+                    if ref_unet.training:
+                        for name, block in ref_unet.named_children():
+                            grad = torch.tensor(0.0).to(accelerator.device)
+                            for p in block.parameters():
+                                if p.grad is not None:
+                                    grad += p.grad.norm()
+                                    # grad += p.grad.abs().max()
+                            ref_unet_grad_dict[name+'.grad.ref_unet'] = grad.detach().item()
+                        accelerator.log(ref_unet_grad_dict, step=global_step)
+                    
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
+                    accelerator.clip_grad_norm_(ref_unet.parameters(), args.max_grad_norm)
+                    # TODO:
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()

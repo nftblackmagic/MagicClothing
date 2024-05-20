@@ -5,17 +5,17 @@ accelerate launch  train_text_to_image.py \
     --pretrained_model_name_or_path=$MODEL_NAME \
     --dataset_name=$DATASET_NAME \
     --dataroot="/workspace/MagicClothing/data/VITON-HD" \
-    --train_data_list="train_pairs.txt"  \
+    --train_data_list="subtrain_1.txt"  \
     --validation_data_list="subtrain_1.txt"  \
-    --use_ema \
     --mixed_precision="fp16"  \
     --resolution=512   \
     --center_crop  \
     --random_flip \
-    --train_batch_size=30 \
+    --train_batch_size=5 \
     --gradient_accumulation_steps=4 \
-    --gradient_checkpointing \
-    --max_train_steps=15000 \
+    --ref_unet_gradient_checkpointing \
+    --gradient_checkpointing  \
+    --num_train_epochs=5000 \
     --learning_rate=1e-05 \
     --max_grad_norm=1 \
     --lr_scheduler="constant" \
